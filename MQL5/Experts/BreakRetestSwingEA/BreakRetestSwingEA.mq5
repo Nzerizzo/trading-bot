@@ -7,6 +7,7 @@
 #include <Trade/PositionInfo.mqh>
 #include <Trade/OrderInfo.mqh>
 #include <Arrays/ArrayObj.mqh>
+
 #ifdef __MQL5__
 #ifdef BRSWING_USE_CALENDAR
 #include <Calendar/Calendar.mqh>
@@ -29,6 +30,7 @@ int CalendarValueHistory(CalendarValue &values[],datetime from,datetime to)
   }
 #endif
 #endif
+
 
 enum ENUM_TrailMethod
   {
@@ -55,6 +57,7 @@ struct TimeRange
    int                start_minute;
    int                end_minute;
   };
+
 
 class LevelZone : public CObject
   {
@@ -83,6 +86,7 @@ public:
       created = other.created;
      }
 
+
    double             price;
    double             lower;
    double             upper;
@@ -92,6 +96,7 @@ public:
    double             atr_on_creation;
    datetime           created;
   };
+
 
 class BrokenSetup : public CObject
   {
@@ -167,6 +172,9 @@ public:
    string             Symbol() const { return m_symbol; }
    ENUM_TIMEFRAMES    PrimaryTf() const { return m_primary_tf; }
 
+   friend bool        IsNewPrimaryBar(CSymbolState *state,datetime &bar_time);
+
+
 private:
    string             m_symbol;
    ENUM_TIMEFRAMES    m_primary_tf;
@@ -183,6 +191,7 @@ private:
    void               DrawZones();
    void               ClearDrawings();
    bool               UpdatePrimaryBar(datetime &bar_time);
+
   };
 
 //--- trading and order helpers
@@ -281,6 +290,9 @@ void   ParseAllowedSessions(const string text);
 bool   IsWithinAllowedSession(const datetime current_time);
 bool   IsSpreadAcceptable(const string symbol);
 double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period);
+
+bool   IsNewPrimaryBar(CSymbolState *state,datetime &bar_time);
+
 bool   CheckNewsWindow();
 void   ResetDailyStatsIfNeeded();
 void   UpdateRiskLimits();
@@ -347,7 +359,9 @@ void CSymbolState::Reset()
 void CSymbolState::Process()
   {
    datetime bar_time = 0;
+
    if(!UpdatePrimaryBar(bar_time))
+
       return;
 
    MqlRates rates[];
@@ -390,6 +404,7 @@ void CSymbolState::ManagePositions()
   {
    // placeholder: actual management handled globally to allow multi-symbol sync
   }
+
 
 bool CSymbolState::UpdatePrimaryBar(datetime &bar_time)
   {
@@ -759,6 +774,7 @@ double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period)
    return(buffer[0]);
   }
 
+
 bool CheckNewsWindow()
   {
 #ifdef __MQL5__
@@ -774,6 +790,7 @@ bool CheckNewsWindow()
      }
    return(true);
  #else
+
    if(!InpUseNewsFilter)
       return(true);
    datetime from = TimeCurrent() - InpNewsBlockMinutesBefore*60;
@@ -796,7 +813,9 @@ bool CheckNewsWindow()
         }
      }
    return(true);
+
  #endif
+
 #else
    return(true);
 #endif
@@ -847,6 +866,7 @@ void UpdateRiskLimits()
   {
    // risk governance is evaluated dynamically via EvaluateDrawdownProtection and budgeting helpers
   }
+
 
 void UpdatePeakEquity()
   {
