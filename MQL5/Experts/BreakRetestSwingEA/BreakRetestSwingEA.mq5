@@ -7,6 +7,7 @@
 #include <Trade/PositionInfo.mqh>
 #include <Trade/OrderInfo.mqh>
 #include <Arrays/ArrayObj.mqh>
+
 #ifdef __MQL5__
  #ifdef BRSWING_USE_CALENDAR
   #include <Calendar/Calendar.mqh>
@@ -24,6 +25,7 @@ struct MqlCalendarValue
    datetime           time;
    int                importance;
   };
+  
 int CalendarValueHistory(MqlCalendarValue &values[],datetime from,datetime to,const string country="",const string currency="")
   {
    ArrayResize(values,0);
@@ -168,6 +170,8 @@ public:
    string             Symbol() const { return m_symbol; }
    ENUM_TIMEFRAMES    PrimaryTf() const { return m_primary_tf; }
 
+   friend bool        IsNewPrimaryBar(CSymbolState *state,datetime &bar_time);
+
 private:
    string             m_symbol;
    ENUM_TIMEFRAMES    m_primary_tf;
@@ -184,6 +188,7 @@ private:
    void               DrawZones();
    void               ClearDrawings();
    bool               UpdatePrimaryBar(datetime &bar_time);
+
   };
 
 //--- trading and order helpers
@@ -273,6 +278,7 @@ bool                 g_dd_limit_breached = false;
 bool                 g_dd_close_done = false;
 int                  g_today_trade_count = 0;
 TimeRange            g_allowed_sessions[];
+
 bool                 g_calendar_warning_shown = false;
 
 //--- utility forward declarations
@@ -283,6 +289,9 @@ void   ParseAllowedSessions(const string text);
 bool   IsWithinAllowedSession(const datetime current_time);
 bool   IsSpreadAcceptable(const string symbol);
 double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period);
+
+bool   IsNewPrimaryBar(CSymbolState *state,datetime &bar_time);
+
 bool   CheckNewsWindow();
 void   ResetDailyStatsIfNeeded();
 void   UpdateRiskLimits();
@@ -345,11 +354,11 @@ void CSymbolState::Reset()
    if(InpDrawObjects)
       ClearDrawings();
   }
-
 void CSymbolState::Process()
   {
    datetime bar_time = 0;
    if(!UpdatePrimaryBar(bar_time))
+
       return;
 
    MqlRates rates[];
@@ -366,15 +375,14 @@ void CSymbolState::Process()
 
    RefreshLevels();
 
-   MqlRates last_rates[];
-   if(CopyRates(m_symbol,m_primary_tf,1,1,last_rates)!=1)
+   MqlRates last_bar;
+   if(CopyRates(m_symbol,m_primary_tf,1,1,&last_bar)!=1)
       return;
-   MqlRates last_bar = last_rates[0];
 
-   MqlRates prev_rates[];
-   if(CopyRates(m_symbol,m_primary_tf,2,1,prev_rates)==1)
+   MqlRates prev_bar;
+   if(CopyRates(m_symbol,m_primary_tf,2,1,&prev_bar)==1)
      {
-      MqlRates prev_bar = prev_rates[0];
+
       double gap = MathAbs(last_bar.open - prev_bar.close);
       if(gap>=atr*InpGapInvalidateATRmult)
         {
@@ -475,7 +483,9 @@ void CSymbolState::RefreshLevels()
       LevelZone *zone = (LevelZone*)temp.At(idx);
       if(zone==NULL)
          continue;
+
       if(zone->touches>=InpMinTouches)
+
         {
          m_levels.Add(zone);
         }
@@ -526,6 +536,7 @@ void CSymbolState::DetectBreakouts(const MqlRates &last_bar,const double atr_val
             setup->atr_on_break = atr_value;
             m_broken_setups.Add(setup);
             LogPrint(1,StringFormat("%s: support %.5f broken bearish",m_symbol,zone->price));
+
            }
         }
      }
@@ -545,11 +556,14 @@ void CSymbolState::DetectBreakouts(const MqlRates &last_bar,const double atr_val
 
       // confirm candle
       if(InpRequirePinBar && !ValidatePinBar(m_symbol,m_primary_tf,1,setup->direction))
+
         {
          LogPrint(2,StringFormat("%s: pin bar confirmation failed",m_symbol));
          continue;
         }
+
       if(InpRequireEngulfing && !ValidateEngulfing(m_symbol,m_primary_tf,1,setup->direction))
+
         {
          LogPrint(2,StringFormat("%s: engulfing confirmation failed",m_symbol));
          continue;
@@ -557,12 +571,16 @@ void CSymbolState::DetectBreakouts(const MqlRates &last_bar,const double atr_val
       if(!InpRequirePinBar && !InpRequireEngulfing)
         {
          // optional: still ensure candle close direction
+
          if(setup->direction==BREAK_DIRECTION_BULLISH && last_bar.close<last_bar.open)
+
            {
             LogPrint(2,StringFormat("%s: bullish retest lacks bullish close",m_symbol));
             continue;
            }
+
          if(setup->direction==BREAK_DIRECTION_BEARISH && last_bar.close>last_bar.open)
+
            {
             LogPrint(2,StringFormat("%s: bearish retest lacks bearish close",m_symbol));
             continue;
@@ -570,6 +588,7 @@ void CSymbolState::DetectBreakouts(const MqlRates &last_bar,const double atr_val
         }
 
       if(!EvaluateEntryFilters(m_symbol,setup->direction,setup->atr_on_break,last_bar.time,last_bar.close))
+
         {
          LogPrint(1,StringFormat("%s: entry filters failed",m_symbol));
          continue;
@@ -579,6 +598,7 @@ void CSymbolState::DetectBreakouts(const MqlRates &last_bar,const double atr_val
          continue;
 
       setup->order_placed = true;
+
       RegisterNewTrade();
      }
   }
@@ -609,6 +629,7 @@ void CSymbolState::DrawZones()
       if(zone==NULL)
          continue;
       clr = zone->type==LEVEL_TYPE_RESISTANCE ? clrTomato : clrDeepSkyBlue;
+
       DrawZone(m_symbol,*zone,clr,"Zone");
      }
   }
@@ -763,6 +784,7 @@ double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period)
    return(buffer[0]);
   }
 
+
 bool CheckNewsWindow()
   {
 #ifdef __MQL5__
@@ -785,6 +807,7 @@ bool CheckNewsWindow()
    string impact = InpNewsImpact;
    StringToLower(impact);
    if(StringFind(impact,"med")>=0)
+
       required_importance = CALENDAR_IMPORTANCE_MEDIUM;
    for(int i=0;i<ArraySize(values);i++)
      {
@@ -799,6 +822,7 @@ bool CheckNewsWindow()
      }
    return(true);
 #endif
+
 #else
    return(true);
 #endif
@@ -883,6 +907,7 @@ void EvaluateDrawdownProtection()
                if(state==NULL)
                   continue;
                string symbol = state->Symbol();
+
                for(int p=PositionsTotal()-1;p>=0;p--)
                  {
                   if(!PositionSelectByIndex(p))
@@ -1016,6 +1041,7 @@ void SyncTradeStates()
       state->tp1_done=false;
       state->tp2_done=false;
       state->tp3_done=false;
+
       g_trade_states.Add(state);
      }
   }
@@ -1026,6 +1052,7 @@ TradeState *FindTradeState(const ulong ticket)
      {
       TradeState *state = (TradeState*)g_trade_states.At(i);
       if(state!=NULL && state->ticket==ticket)
+
          return(state);
      }
    return(NULL);
@@ -1037,6 +1064,7 @@ void RemoveTradeState(const ulong ticket)
      {
       TradeState *state = (TradeState*)g_trade_states.At(i);
       if(state!=NULL && state->ticket==ticket)
+
         {
          delete state;
          g_trade_states.Delete(i);
@@ -1056,7 +1084,9 @@ void UpdateTradeStates()
          g_trade_states.Delete(i);
          continue;
         }
+
       ulong ticket = state->ticket;
+
       if(!PositionSelectByTicket(ticket))
         {
          delete state;
@@ -1434,6 +1464,7 @@ bool AddOrUpdateLevel(CArrayObj &collection,const string symbol,const double pri
    new_zone->type = type;
    new_zone->atr_on_creation = atr;
    new_zone->created = touch_time;
+
    collection.Add(new_zone);
    return(true);
   }
@@ -1688,6 +1719,7 @@ void OnTimer()
       if(state==NULL)
          continue;
       state->Process();
+
      }
   }
 
