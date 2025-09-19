@@ -1,0 +1,1693 @@
+#property copyright "OpenAI"
+#property link      "https://openai.com"
+#property version   "1.00"
+#property strict
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+#include <Trade/OrderInfo.mqh>
+#include <Arrays/ArrayObj.mqh>
+#ifdef __MQL5__
+ #ifdef BRSWING_USE_CALENDAR
+  #include <Calendar/Calendar.mqh>
+  #define BRSWING_HAS_CALENDAR 1
+ #endif
+#endif
+
+#ifndef BRSWING_HAS_CALENDAR
+ #define CALENDAR_IMPORTANCE_LOW    0
+ #define CALENDAR_IMPORTANCE_MEDIUM 1
+ #define CALENDAR_IMPORTANCE_HIGH   2
+ #define BRSWING_CALENDAR_STUB      1
+struct MqlCalendarValue
+  {
+   datetime           time;
+   int                importance;
+  };
+int CalendarValueHistory(MqlCalendarValue &values[],datetime from,datetime to,const string country="",const string currency="")
+  {
+   ArrayResize(values,0);
+   return(0);
+  }
+#endif
+
+enum ENUM_TrailMethod
+  {
+   TRAIL_METHOD_NONE=0,
+   TRAIL_METHOD_ATR=1,
+   TRAIL_METHOD_SWING=2
+  };
+
+enum ENUM_LevelType
+  {
+   LEVEL_TYPE_SUPPORT=0,
+   LEVEL_TYPE_RESISTANCE=1
+  };
+
+enum ENUM_BreakDirection
+  {
+   BREAK_DIRECTION_NONE=0,
+   BREAK_DIRECTION_BULLISH=1,
+   BREAK_DIRECTION_BEARISH=-1
+  };
+
+struct TimeRange
+  {
+   int                start_minute;
+   int                end_minute;
+  };
+
+class LevelZone : public CObject
+  {
+public:
+                     LevelZone()
+     : price(0.0),
+       lower(0.0),
+       upper(0.0),
+       touches(0),
+       last_touch_time(0),
+       type(LEVEL_TYPE_SUPPORT),
+       atr_on_creation(0.0),
+       created(0)
+     {
+     }
+
+   void               CopyFrom(const LevelZone &other)
+     {
+      price = other.price;
+      lower = other.lower;
+      upper = other.upper;
+      touches = other.touches;
+      last_touch_time = other.last_touch_time;
+      type = other.type;
+      atr_on_creation = other.atr_on_creation;
+      created = other.created;
+     }
+
+   double             price;
+   double             lower;
+   double             upper;
+   int                touches;
+   datetime           last_touch_time;
+   ENUM_LevelType     type;
+   double             atr_on_creation;
+   datetime           created;
+  };
+
+class BrokenSetup : public CObject
+  {
+public:
+                     BrokenSetup()
+     : direction(BREAK_DIRECTION_NONE),
+       break_time(0),
+       expiry_time(0),
+       retest_tagged(false),
+       order_placed(false),
+       atr_on_break(0.0)
+     {
+     }
+
+   LevelZone          zone;
+   ENUM_BreakDirection direction;
+   datetime           break_time;
+   datetime           expiry_time;
+   bool               retest_tagged;
+   bool               order_placed;
+   double             atr_on_break;
+  };
+
+class TradeState : public CObject
+  {
+public:
+                     TradeState()
+     : ticket(0),
+       symbol(""),
+       entry_price(0.0),
+       stop_loss(0.0),
+       risk_per_lot(0.0),
+       planned_risk(0.0),
+       initial_lots(0.0),
+       tp_main(0.0),
+       tp1(0.0),
+       tp2(0.0),
+       tp3(0.0),
+       tp1_done(false),
+       tp2_done(false),
+       tp3_done(false)
+     {
+     }
+
+   ulong              ticket;
+   string             symbol;
+   double             entry_price;
+   double             stop_loss;
+   double             risk_per_lot;
+   double             planned_risk;
+   double             initial_lots;
+   double             tp_main;
+   double             tp1;
+   double             tp2;
+   double             tp3;
+   bool               tp1_done;
+   bool               tp2_done;
+   bool               tp3_done;
+  };
+
+class CSymbolState : public CObject
+  {
+public:
+                     CSymbolState(const string symbol,
+                                  const ENUM_TIMEFRAMES primary_tf,
+                                  const ENUM_TIMEFRAMES filter_tf);
+                    ~CSymbolState();
+
+   void               Reset();
+   void               Process();
+   void               ManagePositions();
+
+   string             Symbol() const { return m_symbol; }
+   ENUM_TIMEFRAMES    PrimaryTf() const { return m_primary_tf; }
+
+private:
+   string             m_symbol;
+   ENUM_TIMEFRAMES    m_primary_tf;
+   ENUM_TIMEFRAMES    m_filter_tf;
+   datetime           m_last_primary_bar;
+   CArrayObj          m_levels;
+   CArrayObj          m_broken_setups;
+
+   void               UpdatePrimarySeries();
+   void               RefreshLevels();
+   void               DetectBreakouts(const MqlRates &last_bar,
+                                      const double atr_value);
+   void               CleanupExpiredSetups(const datetime current_time);
+   void               DrawZones();
+   void               ClearDrawings();
+   bool               UpdatePrimaryBar(datetime &bar_time);
+  };
+
+//--- trading and order helpers
+CTrade               g_trade;
+CPositionInfo        g_position_info;
+COrderInfo           g_order_info;
+
+//--- inputs
+input string         InpSymbols                = "";
+input ENUM_TIMEFRAMES InpPrimaryTF             = PERIOD_H4;
+input ENUM_TIMEFRAMES InpFilterTF              = PERIOD_D1;
+input ulong          InpMagicNumber            = 20240315;
+input string         InpCommentPrefix          = "BRSwing";
+input int            InpSlippagePoints         = 30;
+
+input int            InpFractalDepth           = 4;
+input int            InpMinTouches             = 2;
+input int            InpMinBarsBetweenTouches  = 10;
+input int            InpATRPeriod              = 14;
+input double         InpLevelZoneATRmult       = 0.25;
+input bool           InpUseRoundNumbers        = false;
+input double         InpRoundIncrementPips     = 50.0;
+input double         InpMinLevelSeparationPips = 15.0;
+
+input double         InpBreakBufferATRmult     = 0.3;
+input int            InpMaxRetestBars          = 8;
+input double         InpRetestToleranceATRmult = 0.25;
+
+input bool           InpRequirePinBar          = true;
+input double         InpPinWickFactor          = 2.0;
+input double         InpClosePercentile        = 0.3;
+input bool           InpRequireEngulfing       = false;
+
+input bool           InpUseEMAFilter           = true;
+input int            InpEMAPeriod              = 200;
+input bool           InpUseRSIFilter           = false;
+input int            InpRSIPeriod              = 14;
+input double         InpRSIUpper               = 65.0;
+input double         InpRSILower               = 35.0;
+
+input bool           InpUseLimitAtMidZone      = false;
+input double         InpSL_BufferATRmult       = 0.5;
+input double         InpSL_ATRmult             = 1.2;
+input bool           InpUseMaxOfZoneOrATR      = true;
+
+input double         InpTargetRR               = 2.0;
+input bool           InpUseMultiTP             = false;
+input double         InpTP1_RR                 = 1.0;
+input double         InpTP2_RR                 = 2.0;
+input string         InpTP3_Method             = "swing";
+
+input double         InpBE_TriggerRR           = 1.0;
+input double         InpBE_LockPips            = 3.0;
+input ENUM_TrailMethod InpTrailMethod          = TRAIL_METHOD_NONE;
+input double         InpATR_TrailMult          = 1.5;
+
+input int            InpMaxPositionsPerSymbol  = 1;
+input int            InpMaxTradesPerDay        = 3;
+input string         InpAllowedHours           = "07:00-21:00";
+input bool           InpUseNewsFilter          = false;
+input string         InpNewsImpact             = "High";
+input int            InpNewsBlockMinutesBefore = 60;
+input int            InpNewsBlockMinutesAfter  = 60;
+
+input double         InpRiskPercent            = 0.75;
+input double         InpMaxDailyRiskPercent    = 2.0;
+input double         InpDailyLossLimitPercent  = 4.0;
+input double         InpMaxDrawdownPercent     = 8.0;
+input bool           InpCloseAllOnDD           = false;
+input bool           InpUseCustomDayStart      = false;
+input int            InpCustomDayStartHour     = 0;
+
+input bool           InpBacktestMode           = false;
+input int            InpLogVerbosity           = 1;
+input bool           InpDrawObjects            = true;
+input double         InpMaxSpreadPoints        = 30.0;
+input double         InpGapInvalidateATRmult   = 1.5;
+
+//--- globals
+CArrayObj            g_symbols;
+CArrayObj            g_trade_states;
+double               g_day_start_equity = 0.0;
+datetime             g_day_start_time = 0;
+double               g_peak_equity = 0.0;
+bool                 g_daily_limit_breached = false;
+bool                 g_dd_limit_breached = false;
+bool                 g_dd_close_done = false;
+int                  g_today_trade_count = 0;
+TimeRange            g_allowed_sessions[];
+bool                 g_calendar_warning_shown = false;
+
+//--- utility forward declarations
+void   LogPrint(const int level,const string message);
+string Trim(const string text);
+void   ParseSymbols(const string text);
+void   ParseAllowedSessions(const string text);
+bool   IsWithinAllowedSession(const datetime current_time);
+bool   IsSpreadAcceptable(const string symbol);
+double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period);
+bool   CheckNewsWindow();
+void   ResetDailyStatsIfNeeded();
+void   UpdateRiskLimits();
+double CalculatePositionRiskPercent(const ulong ticket);
+double CalculateOpenRiskPercent();
+bool   CheckDailyRiskBudget(const double upcoming_risk);
+bool   CheckMaxPositionsPerSymbol(const string symbol);
+bool   CheckMaxTradesPerDay();
+void   RegisterNewTrade();
+void   UpdateTradeStates();
+void   ManageTradeState(TradeState &state);
+TradeState *FindTradeState(const ulong ticket);
+void   RemoveTradeState(const ulong ticket);
+void   SyncTradeStates();
+void   UpdatePeakEquity();
+void   EvaluateDrawdownProtection();
+bool   EvaluateEntryFilters(const string symbol,const ENUM_BreakDirection direction,const double atr_value,const datetime signal_time,const double close_price);
+bool   CheckEMAFilter(const string symbol,const ENUM_TIMEFRAMES tf,const int period,const ENUM_BreakDirection direction);
+bool   CheckRSIFilter(const string symbol,const ENUM_TIMEFRAMES tf,const int period,const double lower,const double upper);
+bool   ValidatePinBar(const string symbol,const ENUM_TIMEFRAMES tf,const int shift,const ENUM_BreakDirection direction);
+bool   ValidateEngulfing(const string symbol,const ENUM_TIMEFRAMES tf,const int shift,const ENUM_BreakDirection direction);
+bool   PriceTouchedZone(const string symbol,const ENUM_TIMEFRAMES tf,const int shift,const LevelZone &zone,const double tolerance);
+double PipSize(const string symbol);
+double PipsToPrice(const string symbol,const double pips);
+double NormalizePrice(const string symbol,const double price);
+void   DrawZone(const string symbol,const LevelZone &zone,const color clr,const string prefix);
+void   ClearSymbolDrawings(const string symbol);
+bool   DeriveTP3Price(const string symbol,const ENUM_BreakDirection direction,const ENUM_TIMEFRAMES tf,const double entry,const double stop,double &tp_price);
+bool   PlaceOrders(const string symbol,const ENUM_BreakDirection direction,const LevelZone &zone,const double atr_value,const double confirmation_close);
+LevelZone *FindMatchingZone(CArrayObj &collection,const double price,const ENUM_LevelType type,const double tolerance);
+bool   AddOrUpdateLevel(CArrayObj &collection,const string symbol,const double price,const ENUM_LevelType type,const datetime touch_time,const double atr,const double zone_width);
+void   ClearCollection(CArrayObj &collection);
+
+//+------------------------------------------------------------------+
+//| CSymbolState implementation                                      |
+//+------------------------------------------------------------------+
+CSymbolState::CSymbolState(const string symbol,
+                           const ENUM_TIMEFRAMES primary_tf,
+                           const ENUM_TIMEFRAMES filter_tf)
+  : m_symbol(symbol),
+    m_primary_tf(primary_tf),
+    m_filter_tf(filter_tf),
+    m_last_primary_bar(0)
+  {
+   m_levels.Create();
+   m_broken_setups.Create();
+  }
+
+CSymbolState::~CSymbolState()
+  {
+   ClearCollection(m_levels);
+   ClearCollection(m_broken_setups);
+  }
+
+void CSymbolState::Reset()
+  {
+   ClearCollection(m_levels);
+   ClearCollection(m_broken_setups);
+   m_last_primary_bar = 0;
+   if(InpDrawObjects)
+      ClearDrawings();
+  }
+
+void CSymbolState::Process()
+  {
+   datetime bar_time = 0;
+   if(!UpdatePrimaryBar(bar_time))
+      return;
+
+   MqlRates rates[];
+   const int copied = CopyRates(m_symbol,m_primary_tf,0,InpFractalDepth*4+20,rates);
+   if(copied<=InpFractalDepth+2)
+     {
+      LogPrint(2,StringFormat("%s: insufficient bars to process",m_symbol));
+      return;
+     }
+
+   double atr = CurrentATR(m_symbol,m_primary_tf,InpATRPeriod);
+   if(atr<=0.0)
+      return;
+
+   RefreshLevels();
+
+   MqlRates last_rates[];
+   if(CopyRates(m_symbol,m_primary_tf,1,1,last_rates)!=1)
+      return;
+   MqlRates last_bar = last_rates[0];
+
+   MqlRates prev_rates[];
+   if(CopyRates(m_symbol,m_primary_tf,2,1,prev_rates)==1)
+     {
+      MqlRates prev_bar = prev_rates[0];
+      double gap = MathAbs(last_bar.open - prev_bar.close);
+      if(gap>=atr*InpGapInvalidateATRmult)
+        {
+         LogPrint(1,StringFormat("%s: gap detected, clearing setups",m_symbol));
+         ClearCollection(m_broken_setups);
+        }
+     }
+
+   DetectBreakouts(last_bar,atr);
+   CleanupExpiredSetups(TimeCurrent());
+
+   if(InpDrawObjects)
+      DrawZones();
+  }
+
+void CSymbolState::ManagePositions()
+  {
+   // placeholder: actual management handled globally to allow multi-symbol sync
+  }
+
+bool CSymbolState::UpdatePrimaryBar(datetime &bar_time)
+  {
+   datetime times[1];
+   if(CopyTime(m_symbol,m_primary_tf,0,1,times)!=1)
+      return(false);
+   if(m_last_primary_bar==times[0])
+      return(false);
+   m_last_primary_bar = times[0];
+   bar_time = times[0];
+   return(true);
+  }
+
+void CSymbolState::UpdatePrimarySeries()
+  {
+  }
+
+void CSymbolState::RefreshLevels()
+  {
+   ClearCollection(m_levels);
+
+   const int lookback = 500;
+   MqlRates rates[];
+   int copied = CopyRates(m_symbol,m_primary_tf,0,lookback,rates);
+   if(copied<=InpFractalDepth*2+2)
+      return;
+
+   double atr = CurrentATR(m_symbol,m_primary_tf,InpATRPeriod);
+   if(atr<=0.0)
+      return;
+
+   CArrayObj temp;
+   temp.Create();
+
+   double zone_width = atr*InpLevelZoneATRmult;
+   for(int i=copied-InpFractalDepth-1;i>=InpFractalDepth;i--)
+     {
+      bool fractal_high = true;
+      bool fractal_low = true;
+      for(int j=1;j<=InpFractalDepth;j++)
+        {
+         if(rates[i].high <= rates[i-j].high || rates[i].high <= rates[i+j].high)
+            fractal_high = false;
+         if(rates[i].low >= rates[i-j].low || rates[i].low >= rates[i+j].low)
+            fractal_low = false;
+        }
+
+      if(fractal_high)
+         AddOrUpdateLevel(temp,m_symbol,rates[i].high,LEVEL_TYPE_RESISTANCE,rates[i].time,atr,zone_width);
+      if(fractal_low)
+         AddOrUpdateLevel(temp,m_symbol,rates[i].low,LEVEL_TYPE_SUPPORT,rates[i].time,atr,zone_width);
+     }
+
+   if(InpUseRoundNumbers)
+     {
+      double pip = PipSize(m_symbol);
+      double increment = InpRoundIncrementPips*pip;
+      if(increment>0.0)
+        {
+         double min_price = rates[copied-1].low;
+         double max_price = rates[0].high;
+         double start = MathFloor(min_price/increment)*increment;
+         for(double level=start; level<=max_price; level+=increment)
+           {
+            for(int k=copied-1;k>=0;k--)
+              {
+               if(rates[k].low<=level+zone_width && rates[k].high>=level-zone_width)
+                 {
+                  ENUM_LevelType type = rates[k].close>=level ? LEVEL_TYPE_SUPPORT : LEVEL_TYPE_RESISTANCE;
+                  AddOrUpdateLevel(temp,m_symbol,level,type,rates[k].time,atr,zone_width);
+                 }
+              }
+           }
+        }
+     }
+
+   for(int idx=0; idx<temp.Total(); idx++)
+     {
+      LevelZone *zone = (LevelZone*)temp.At(idx);
+      if(zone==NULL)
+         continue;
+      if(zone->touches>=InpMinTouches)
+        {
+         m_levels.Add(zone);
+        }
+      else
+        {
+         delete zone;
+        }
+     }
+   temp.Clear();
+  }
+
+void CSymbolState::DetectBreakouts(const MqlRates &last_bar,const double atr_value)
+  {
+   for(int i=0;i<m_levels.Total();i++)
+     {
+      LevelZone *zone = (LevelZone*)m_levels.At(i);
+      if(zone==NULL)
+         continue;
+
+      double buffer = InpBreakBufferATRmult*atr_value;
+      if(zone->type==LEVEL_TYPE_RESISTANCE)
+        {
+         if(last_bar.close >= zone->price + buffer)
+           {
+            BrokenSetup *setup = new BrokenSetup;
+            setup->zone.CopyFrom(*zone);
+            setup->direction = BREAK_DIRECTION_BULLISH;
+            setup->break_time = last_bar.time;
+            setup->expiry_time = last_bar.time + PeriodSeconds(m_primary_tf)*InpMaxRetestBars;
+            setup->retest_tagged = false;
+            setup->order_placed = false;
+            setup->atr_on_break = atr_value;
+            m_broken_setups.Add(setup);
+            LogPrint(1,StringFormat("%s: resistance %.5f broken bullish",m_symbol,zone->price));
+           }
+        }
+      else if(zone->type==LEVEL_TYPE_SUPPORT)
+        {
+         if(last_bar.close <= zone->price - buffer)
+           {
+            BrokenSetup *setup = new BrokenSetup;
+            setup->zone.CopyFrom(*zone);
+            setup->direction = BREAK_DIRECTION_BEARISH;
+            setup->break_time = last_bar.time;
+            setup->expiry_time = last_bar.time + PeriodSeconds(m_primary_tf)*InpMaxRetestBars;
+            setup->retest_tagged = false;
+            setup->order_placed = false;
+            setup->atr_on_break = atr_value;
+            m_broken_setups.Add(setup);
+            LogPrint(1,StringFormat("%s: support %.5f broken bearish",m_symbol,zone->price));
+           }
+        }
+     }
+
+   // evaluate retests on last closed bar
+   for(int j=0;j<m_broken_setups.Total();j++)
+     {
+      BrokenSetup *setup = (BrokenSetup*)m_broken_setups.At(j);
+      if(setup==NULL)
+         continue;
+      if(setup->order_placed)
+         continue;
+
+      double tolerance = setup->atr_on_break*InpRetestToleranceATRmult;
+      if(!PriceTouchedZone(m_symbol,m_primary_tf,1,setup->zone,tolerance))
+         continue;
+
+      // confirm candle
+      if(InpRequirePinBar && !ValidatePinBar(m_symbol,m_primary_tf,1,setup->direction))
+        {
+         LogPrint(2,StringFormat("%s: pin bar confirmation failed",m_symbol));
+         continue;
+        }
+      if(InpRequireEngulfing && !ValidateEngulfing(m_symbol,m_primary_tf,1,setup->direction))
+        {
+         LogPrint(2,StringFormat("%s: engulfing confirmation failed",m_symbol));
+         continue;
+        }
+      if(!InpRequirePinBar && !InpRequireEngulfing)
+        {
+         // optional: still ensure candle close direction
+         if(setup->direction==BREAK_DIRECTION_BULLISH && last_bar.close<last_bar.open)
+           {
+            LogPrint(2,StringFormat("%s: bullish retest lacks bullish close",m_symbol));
+            continue;
+           }
+         if(setup->direction==BREAK_DIRECTION_BEARISH && last_bar.close>last_bar.open)
+           {
+            LogPrint(2,StringFormat("%s: bearish retest lacks bearish close",m_symbol));
+            continue;
+           }
+        }
+
+      if(!EvaluateEntryFilters(m_symbol,setup->direction,setup->atr_on_break,last_bar.time,last_bar.close))
+        {
+         LogPrint(1,StringFormat("%s: entry filters failed",m_symbol));
+         continue;
+        }
+
+      if(!PlaceOrders(m_symbol,setup->direction,setup->zone,setup->atr_on_break,last_bar.close))
+         continue;
+
+      setup->order_placed = true;
+      RegisterNewTrade();
+     }
+  }
+
+void CSymbolState::CleanupExpiredSetups(const datetime current_time)
+  {
+   for(int i=m_broken_setups.Total()-1;i>=0;i--)
+     {
+      BrokenSetup *setup = (BrokenSetup*)m_broken_setups.At(i);
+      if(setup==NULL)
+         continue;
+      if(current_time>setup->expiry_time)
+        {
+         LogPrint(1,StringFormat("%s: setup around %.5f expired",m_symbol,setup->zone.price));
+         delete setup;
+         m_broken_setups.Delete(i);
+        }
+     }
+  }
+
+void CSymbolState::DrawZones()
+  {
+   ClearDrawings();
+   color clr = clrDodgerBlue;
+   for(int i=0;i<m_levels.Total();i++)
+     {
+      LevelZone *zone = (LevelZone*)m_levels.At(i);
+      if(zone==NULL)
+         continue;
+      clr = zone->type==LEVEL_TYPE_RESISTANCE ? clrTomato : clrDeepSkyBlue;
+      DrawZone(m_symbol,*zone,clr,"Zone");
+     }
+  }
+
+void CSymbolState::ClearDrawings()
+  {
+   ClearSymbolDrawings(m_symbol);
+  }
+
+//+------------------------------------------------------------------+
+//| Utility implementation                                           |
+//+------------------------------------------------------------------+
+void LogPrint(const int level,const string message)
+  {
+   if(level>InpLogVerbosity)
+      return;
+   PrintFormat("[BRSwing] %s",message);
+  }
+
+string Trim(const string text)
+  {
+   string tmp=text;
+   tmp=StringTrimLeft(tmp);
+   tmp=StringTrimRight(tmp);
+   return(tmp);
+  }
+
+void ClearCollection(CArrayObj &collection)
+  {
+   for(int i=collection.Total()-1;i>=0;i--)
+     {
+      CObject *obj = collection.At(i);
+      if(obj!=NULL)
+         delete obj;
+      collection.Delete(i);
+     }
+  }
+
+void ParseSymbols(const string text)
+  {
+   for(int i=0;i<g_symbols.Total();i++)
+     {
+      CSymbolState *state = (CSymbolState*)g_symbols.At(i);
+      if(state!=NULL)
+         delete state;
+     }
+   g_symbols.Clear();
+   if(Trim(text)=="")
+     {
+      CSymbolState *state = new CSymbolState(_Symbol,InpPrimaryTF,InpFilterTF);
+      g_symbols.Add(state);
+      return;
+     }
+
+   int total=0;
+   string parts[];
+   total = StringSplit(text,',',parts);
+   if(total<=0)
+     {
+      CSymbolState *state = new CSymbolState(_Symbol,InpPrimaryTF,InpFilterTF);
+      g_symbols.Add(state);
+      return;
+     }
+
+   for(int i=0;i<total;i++)
+     {
+      string symbol = Trim(parts[i]);
+      if(symbol=="")
+         continue;
+      if(!SymbolSelect(symbol,true))
+        {
+         LogPrint(0,StringFormat("Failed to select symbol %s",symbol));
+         continue;
+        }
+      CSymbolState *state = new CSymbolState(symbol,InpPrimaryTF,InpFilterTF);
+      g_symbols.Add(state);
+     }
+  }
+
+void ParseAllowedSessions(const string text)
+  {
+   ArrayFree(g_allowed_sessions);
+   if(text=="" || Trim(text)=="")
+      return;
+   string blocks[];
+   int total = StringSplit(text,';',blocks);
+   if(total<=0)
+     {
+      total = StringSplit(text,',',blocks);
+     }
+   for(int i=0;i<total;i++)
+     {
+      string block = Trim(blocks[i]);
+      if(block=="")
+         continue;
+      string times[2];
+      if(StringSplit(block,'-',times)!=2)
+         continue;
+      int hour1 = StringToInteger(StringSubstr(times[0],0,2));
+      int minute1 = StringToInteger(StringSubstr(times[0],3,2));
+      int hour2 = StringToInteger(StringSubstr(times[1],0,2));
+      int minute2 = StringToInteger(StringSubstr(times[1],3,2));
+      TimeRange range;
+      range.start_minute = hour1*60+minute1;
+      range.end_minute = hour2*60+minute2;
+      const int size = ArraySize(g_allowed_sessions);
+      ArrayResize(g_allowed_sessions,size+1);
+      g_allowed_sessions[size] = range;
+     }
+  }
+
+bool IsWithinAllowedSession(const datetime current_time)
+  {
+   if(ArraySize(g_allowed_sessions)==0)
+      return(true);
+   MqlDateTime tm;
+   TimeToStruct(current_time,tm);
+   int minute_of_day = tm.hour*60 + tm.min;
+   for(int i=0;i<ArraySize(g_allowed_sessions);i++)
+     {
+      TimeRange range = g_allowed_sessions[i];
+      if(range.start_minute<=range.end_minute)
+        {
+         if(minute_of_day>=range.start_minute && minute_of_day<=range.end_minute)
+            return(true);
+        }
+      else
+        {
+         if(minute_of_day>=range.start_minute || minute_of_day<=range.end_minute)
+            return(true);
+        }
+     }
+   return(false);
+  }
+
+bool IsSpreadAcceptable(const string symbol)
+  {
+   double spread = SymbolInfoInteger(symbol,SYMBOL_SPREAD);
+   return(spread<=InpMaxSpreadPoints || InpMaxSpreadPoints<=0);
+  }
+
+double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period)
+  {
+   int handle = iATR(symbol,tf,period);
+   if(handle==INVALID_HANDLE)
+      return(0.0);
+   double buffer[];
+   int copied = CopyBuffer(handle,0,0,period+5,buffer);
+   IndicatorRelease(handle);
+   if(copied<=0)
+      return(0.0);
+   return(buffer[0]);
+  }
+
+bool CheckNewsWindow()
+  {
+#ifdef __MQL5__
+   if(!InpUseNewsFilter)
+      return(true);
+#ifdef BRSWING_CALENDAR_STUB
+   if(!g_calendar_warning_shown)
+     {
+      LogPrint(0,"News filter enabled but calendar library is unavailable; skipping news avoidance.");
+      g_calendar_warning_shown = true;
+     }
+   return(true);
+#else
+   datetime from = TimeCurrent() - InpNewsBlockMinutesBefore*60;
+   datetime to   = TimeCurrent() + InpNewsBlockMinutesAfter*60;
+   MqlCalendarValue values[];
+   if(CalendarValueHistory(values,from,to)<=0)
+      return(true);
+   int required_importance = CALENDAR_IMPORTANCE_HIGH;
+   string impact = InpNewsImpact;
+   StringToLower(impact);
+   if(StringFind(impact,"med")>=0)
+      required_importance = CALENDAR_IMPORTANCE_MEDIUM;
+   for(int i=0;i<ArraySize(values);i++)
+     {
+      if(values[i].importance<required_importance)
+         continue;
+      datetime event_time = values[i].time;
+      if(event_time>=from && event_time<=to)
+        {
+         LogPrint(1,"News filter blocking trading");
+         return(false);
+        }
+     }
+   return(true);
+#endif
+#else
+   return(true);
+#endif
+  }
+
+void ResetDailyStatsIfNeeded()
+  {
+   datetime current = TimeCurrent();
+   if(!InpUseCustomDayStart)
+     {
+      MqlDateTime tm;
+      TimeToStruct(current,tm);
+      tm.hour = 0;
+      tm.min = 0;
+      tm.sec = 0;
+      datetime start = StructToTime(tm);
+      if(start!=g_day_start_time)
+        {
+         g_day_start_time = start;
+         g_day_start_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+         g_today_trade_count = 0;
+         g_daily_limit_breached = false;
+         LogPrint(1,"Daily statistics reset");
+        }
+     }
+   else
+     {
+      MqlDateTime tm;
+      TimeToStruct(current,tm);
+      tm.hour = InpCustomDayStartHour;
+      tm.min = 0;
+      tm.sec = 0;
+      datetime custom_start = StructToTime(tm);
+      if(current < custom_start)
+         custom_start -= 24*60*60;
+      if(custom_start!=g_day_start_time)
+        {
+         g_day_start_time = custom_start;
+         g_day_start_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+         g_today_trade_count = 0;
+         g_daily_limit_breached = false;
+         LogPrint(1,"Custom daily statistics reset");
+        }
+     }
+  }
+
+void UpdateRiskLimits()
+  {
+   // risk governance is evaluated dynamically via EvaluateDrawdownProtection and budgeting helpers
+  }
+
+void UpdatePeakEquity()
+  {
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity>g_peak_equity || g_peak_equity==0.0)
+      g_peak_equity = equity;
+  }
+
+void EvaluateDrawdownProtection()
+  {
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(g_day_start_equity<=0)
+      g_day_start_equity = equity;
+   double daily_loss_percent = (g_day_start_equity-equity)/g_day_start_equity*100.0;
+   if(daily_loss_percent>=InpDailyLossLimitPercent && InpDailyLossLimitPercent>0)
+     {
+      g_daily_limit_breached = true;
+     }
+
+   UpdatePeakEquity();
+   if(g_peak_equity>0)
+     {
+      double dd = (g_peak_equity-equity)/g_peak_equity*100.0;
+      if(dd>=InpMaxDrawdownPercent && InpMaxDrawdownPercent>0)
+        {
+         g_dd_limit_breached = true;
+         if(InpCloseAllOnDD && !g_dd_close_done)
+           {
+            for(int i=0;i<g_symbols.Total();i++)
+              {
+               CSymbolState *state = (CSymbolState*)g_symbols.At(i);
+               if(state==NULL)
+                  continue;
+               string symbol = state->Symbol();
+               for(int p=PositionsTotal()-1;p>=0;p--)
+                 {
+                  if(!PositionSelectByIndex(p))
+                     continue;
+                  if(PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber)
+                     continue;
+                  if(PositionGetString(POSITION_SYMBOL)!=symbol)
+                     continue;
+                  double lots = PositionGetDouble(POSITION_VOLUME);
+                  ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+                  g_trade.PositionClose(ticket);
+                  LogPrint(0,StringFormat("Closed %s %.2f lots due to drawdown protection",symbol,lots));
+                 }
+              }
+            g_dd_close_done = true;
+           }
+        }
+     }
+  }
+
+double CalculatePositionRiskPercent(const ulong ticket)
+  {
+   if(!PositionSelectByTicket(ticket))
+      return(0.0);
+   double sl = PositionGetDouble(POSITION_SL);
+   if(sl==0.0)
+      return(0.0);
+   double price = PositionGetDouble(POSITION_PRICE_OPEN);
+   double lots = PositionGetDouble(POSITION_VOLUME);
+   string symbol = PositionGetString(POSITION_SYMBOL);
+   double tick_value = SymbolInfoDouble(symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(symbol,SYMBOL_TRADE_TICK_SIZE);
+   double risk_per_lot = MathAbs(price-sl)/tick_size * tick_value;
+   double total_risk = risk_per_lot*lots;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity<=0)
+      return(0.0);
+   return(total_risk/equity*100.0);
+  }
+
+double CalculateOpenRiskPercent()
+  {
+   double total = 0.0;
+   for(int i=0;i<PositionsTotal();i++)
+     {
+      if(!PositionSelectByIndex(i))
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber)
+         continue;
+      ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+      total += CalculatePositionRiskPercent(ticket);
+     }
+   return(total);
+  }
+
+bool CheckDailyRiskBudget(const double upcoming_risk)
+  {
+   double open_risk = CalculateOpenRiskPercent();
+   if(open_risk + upcoming_risk > InpMaxDailyRiskPercent && InpMaxDailyRiskPercent>0)
+     {
+      LogPrint(0,StringFormat("Daily risk budget exceeded: %.2f + %.2f > %.2f",open_risk,upcoming_risk,InpMaxDailyRiskPercent));
+      return(false);
+     }
+   return(true);
+  }
+
+bool CheckMaxPositionsPerSymbol(const string symbol)
+  {
+   int count = 0;
+   for(int i=0;i<PositionsTotal();i++)
+     {
+      if(!PositionSelectByIndex(i))
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL)==symbol)
+         count++;
+     }
+   if(count>=InpMaxPositionsPerSymbol)
+     {
+      LogPrint(1,StringFormat("%s: max positions per symbol reached",symbol));
+      return(false);
+     }
+   return(true);
+  }
+
+bool CheckMaxTradesPerDay()
+  {
+   if(InpMaxTradesPerDay<=0)
+      return(true);
+   if(g_today_trade_count>=InpMaxTradesPerDay)
+     {
+      LogPrint(1,"Daily trade cap reached");
+      return(false);
+     }
+   return(true);
+  }
+
+void RegisterNewTrade()
+  {
+   g_today_trade_count++;
+  }
+
+void SyncTradeStates()
+  {
+   for(int i=0;i<PositionsTotal();i++)
+     {
+      if(!PositionSelectByIndex(i))
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber)
+         continue;
+      ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+      TradeState *existing = FindTradeState(ticket);
+      if(existing!=NULL)
+         continue;
+      TradeState *state = new TradeState;
+      state->ticket = ticket;
+      state->symbol = PositionGetString(POSITION_SYMBOL);
+      state->entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      state->stop_loss = PositionGetDouble(POSITION_SL);
+      double tick_value = SymbolInfoDouble(state->symbol,SYMBOL_TRADE_TICK_VALUE);
+      double tick_size = SymbolInfoDouble(state->symbol,SYMBOL_TRADE_TICK_SIZE);
+      double risk_distance = MathAbs(state->entry_price-state->stop_loss);
+      state->risk_per_lot = (tick_size>0)?risk_distance/tick_size*tick_value:0.0;
+      state->initial_lots = PositionGetDouble(POSITION_VOLUME);
+      state->planned_risk = state->risk_per_lot*state->initial_lots;
+      state->tp_main = PositionGetDouble(POSITION_TP);
+      state->tp1 = 0;
+      state->tp2 = 0;
+      state->tp3 = 0;
+      state->tp1_done=false;
+      state->tp2_done=false;
+      state->tp3_done=false;
+      g_trade_states.Add(state);
+     }
+  }
+
+TradeState *FindTradeState(const ulong ticket)
+  {
+   for(int i=0;i<g_trade_states.Total();i++)
+     {
+      TradeState *state = (TradeState*)g_trade_states.At(i);
+      if(state!=NULL && state->ticket==ticket)
+         return(state);
+     }
+   return(NULL);
+  }
+
+void RemoveTradeState(const ulong ticket)
+  {
+   for(int i=0;i<g_trade_states.Total();i++)
+     {
+      TradeState *state = (TradeState*)g_trade_states.At(i);
+      if(state!=NULL && state->ticket==ticket)
+        {
+         delete state;
+         g_trade_states.Delete(i);
+         break;
+        }
+     }
+  }
+
+void UpdateTradeStates()
+  {
+   SyncTradeStates();
+   for(int i=g_trade_states.Total()-1;i>=0;i--)
+     {
+      TradeState *state = (TradeState*)g_trade_states.At(i);
+      if(state==NULL)
+        {
+         g_trade_states.Delete(i);
+         continue;
+        }
+      ulong ticket = state->ticket;
+      if(!PositionSelectByTicket(ticket))
+        {
+         delete state;
+         g_trade_states.Delete(i);
+         continue;
+        }
+      ManageTradeState(*state);
+     }
+  }
+
+void ManageTradeState(TradeState &state)
+  {
+   if(!PositionSelectByTicket(state.ticket))
+      return;
+   string symbol = state.symbol;
+   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl = PositionGetDouble(POSITION_SL);
+   state.entry_price = entry;
+   state.stop_loss = sl;
+   double position_tp = PositionGetDouble(POSITION_TP);
+   if(position_tp>0)
+      state.tp_main = position_tp;
+   double lots = PositionGetDouble(POSITION_VOLUME);
+   int direction = PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY ? 1 : -1;
+   double price = SymbolInfoDouble(symbol,direction>0?SYMBOL_BID:SYMBOL_ASK);
+   double risk_distance = MathAbs(entry-sl);
+
+   // Breakeven
+   if(InpBE_TriggerRR>0 && risk_distance>0)
+     {
+      double trigger_price = entry + direction*risk_distance*InpBE_TriggerRR;
+      if((direction>0 && price>=trigger_price) || (direction<0 && price<=trigger_price))
+        {
+         double new_sl = entry + direction*PipsToPrice(symbol,InpBE_LockPips);
+         double current_sl = PositionGetDouble(POSITION_SL);
+         if((direction>0 && new_sl>current_sl) || (direction<0 && new_sl<current_sl))
+           {
+            g_trade.PositionModify(state.ticket,new_sl,PositionGetDouble(POSITION_TP));
+           }
+        }
+     }
+
+   // Trailing stop management
+   if(InpTrailMethod==TRAIL_METHOD_ATR && InpATR_TrailMult>0)
+     {
+      double atr = CurrentATR(symbol,InpPrimaryTF,InpATRPeriod);
+      if(atr>0)
+        {
+         double trail = atr*InpATR_TrailMult;
+         double new_sl = direction>0 ? price-trail : price+trail;
+         double current_sl = PositionGetDouble(POSITION_SL);
+         if(direction>0 && new_sl>current_sl)
+            g_trade.PositionModify(state.ticket,new_sl,PositionGetDouble(POSITION_TP));
+         if(direction<0 && new_sl<current_sl)
+            g_trade.PositionModify(state.ticket,new_sl,PositionGetDouble(POSITION_TP));
+        }
+     }
+
+   if(InpTrailMethod==TRAIL_METHOD_SWING)
+     {
+      double swing_sl = sl;
+      int lookback = InpFractalDepth*2+5;
+      for(int i=1;i<=lookback;i++)
+        {
+         if(direction>0)
+           {
+            double low = iLow(symbol,InpPrimaryTF,i);
+            if(low==0)
+               break;
+            if(low>swing_sl)
+               swing_sl = low;
+           }
+         else
+           {
+            double high = iHigh(symbol,InpPrimaryTF,i);
+            if(high==0)
+               break;
+            if(high<swing_sl)
+               swing_sl = high;
+           }
+        }
+      double current_sl = PositionGetDouble(POSITION_SL);
+      if(direction>0 && swing_sl>current_sl)
+         g_trade.PositionModify(state.ticket,swing_sl,PositionGetDouble(POSITION_TP));
+      if(direction<0 && swing_sl<current_sl)
+         g_trade.PositionModify(state.ticket,swing_sl,PositionGetDouble(POSITION_TP));
+     }
+
+   if(!InpUseMultiTP)
+      return;
+
+   double point = SymbolInfoDouble(symbol,SYMBOL_POINT);
+   if(state.tp1>0 && !state.tp1_done)
+     {
+      if((direction>0 && price>=state.tp1) || (direction<0 && price<=state.tp1))
+        {
+         double close_volume = lots/2.0;
+         if(close_volume>SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN))
+           {
+            g_trade.PositionClosePartial(state.ticket,close_volume);
+            state.tp1_done = true;
+           }
+        }
+     }
+   if(state.tp2>0 && !state.tp2_done)
+     {
+      if((direction>0 && price>=state.tp2) || (direction<0 && price<=state.tp2))
+        {
+         double close_volume = lots/2.0;
+         if(close_volume>SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN))
+           {
+            g_trade.PositionClosePartial(state.ticket,close_volume);
+            state.tp2_done = true;
+           }
+        }
+     }
+   if(state.tp3>0 && !state.tp3_done)
+     {
+      if((direction>0 && price>=state.tp3) || (direction<0 && price<=state.tp3))
+        {
+         g_trade.PositionClose(state.ticket);
+         state.tp3_done = true;
+        }
+     }
+  }
+
+bool EvaluateEntryFilters(const string symbol,const ENUM_BreakDirection direction,const double atr_value,const datetime signal_time,const double close_price)
+  {
+   if(g_daily_limit_breached || g_dd_limit_breached)
+     {
+      LogPrint(0,"Trading blocked by risk limits");
+      return(false);
+     }
+
+   if(!CheckMaxTradesPerDay())
+      return(false);
+
+   if(!CheckMaxPositionsPerSymbol(symbol))
+      return(false);
+
+   if(!IsWithinAllowedSession(signal_time))
+     {
+      LogPrint(1,"Outside allowed trading hours");
+      return(false);
+     }
+
+   if(!CheckNewsWindow())
+      return(false);
+
+   if(!IsSpreadAcceptable(symbol))
+      return(false);
+
+   if(InpUseEMAFilter && !CheckEMAFilter(symbol,InpPrimaryTF,InpEMAPeriod,direction))
+      return(false);
+
+   if(InpUseRSIFilter && !CheckRSIFilter(symbol,InpPrimaryTF,InpRSIPeriod,InpRSILower,InpRSIUpper))
+      return(false);
+
+   return(true);
+  }
+
+bool CheckEMAFilter(const string symbol,const ENUM_TIMEFRAMES tf,const int period,const ENUM_BreakDirection direction)
+  {
+   if(period<=0)
+      return(true);
+   int handle = iMA(symbol,tf,period,0,MODE_EMA,PRICE_CLOSE);
+   if(handle==INVALID_HANDLE)
+      return(true);
+   double buffer[];
+   int copied = CopyBuffer(handle,0,0,3,buffer);
+   IndicatorRelease(handle);
+   if(copied<=0)
+      return(true);
+   double ema = buffer[0];
+   double price = SymbolInfoDouble(symbol,SYMBOL_BID);
+   if(direction==BREAK_DIRECTION_BULLISH && price<ema)
+      return(false);
+   if(direction==BREAK_DIRECTION_BEARISH && price>ema)
+      return(false);
+   return(true);
+  }
+
+bool CheckRSIFilter(const string symbol,const ENUM_TIMEFRAMES tf,const int period,const double lower,const double upper)
+  {
+   if(period<=0)
+      return(true);
+   int handle = iRSI(symbol,tf,period,PRICE_CLOSE);
+   if(handle==INVALID_HANDLE)
+      return(true);
+   double buffer[];
+   int copied = CopyBuffer(handle,0,0,3,buffer);
+   IndicatorRelease(handle);
+   if(copied<=0)
+      return(true);
+   double rsi = buffer[0];
+   if(rsi>=lower && rsi<=upper)
+      return(false);
+   return(true);
+  }
+
+bool ValidatePinBar(const string symbol,const ENUM_TIMEFRAMES tf,const int shift,const ENUM_BreakDirection direction)
+  {
+   double open = iOpen(symbol,tf,shift);
+   double close = iClose(symbol,tf,shift);
+   double high = iHigh(symbol,tf,shift);
+   double low = iLow(symbol,tf,shift);
+   double body = MathAbs(close-open);
+   double range = high-low;
+   if(range<=0)
+      return(false);
+   if(direction==BREAK_DIRECTION_BULLISH)
+     {
+      double lower_wick = MathMin(open,close)-low;
+      double upper_wick = high-MathMax(open,close);
+      if(lower_wick < body*InpPinWickFactor)
+         return(false);
+      double close_percent = (close-low)/range;
+      if(close_percent < 1.0-InpClosePercentile)
+         return(false);
+      if(upper_wick > body*2.0)
+         return(false);
+     }
+   else if(direction==BREAK_DIRECTION_BEARISH)
+     {
+      double upper_wick = high-MathMax(open,close);
+      double lower_wick = MathMin(open,close)-low;
+      if(upper_wick < body*InpPinWickFactor)
+         return(false);
+      double close_percent = (high-close)/range;
+      if(close_percent < 1.0-InpClosePercentile)
+         return(false);
+      if(lower_wick > body*2.0)
+         return(false);
+     }
+   return(true);
+  }
+
+bool ValidateEngulfing(const string symbol,const ENUM_TIMEFRAMES tf,const int shift,const ENUM_BreakDirection direction)
+  {
+   double open1 = iOpen(symbol,tf,shift);
+   double close1 = iClose(symbol,tf,shift);
+   double open2 = iOpen(symbol,tf,shift+1);
+   double close2 = iClose(symbol,tf,shift+1);
+   if(direction==BREAK_DIRECTION_BULLISH)
+     {
+      return(open1 < close1 && open1 <= close2 && close1 >= open2);
+     }
+   if(direction==BREAK_DIRECTION_BEARISH)
+     {
+      return(open1 > close1 && open1 >= close2 && close1 <= open2);
+     }
+   return(false);
+  }
+
+bool PriceTouchedZone(const string symbol,const ENUM_TIMEFRAMES tf,const int shift,const LevelZone &zone,const double tolerance)
+  {
+   double high = iHigh(symbol,tf,shift);
+   double low = iLow(symbol,tf,shift);
+   if(high==0 || low==0)
+      return(false);
+   double upper = zone.upper + tolerance;
+   double lower = zone.lower - tolerance;
+   return(low<=upper && high>=lower);
+  }
+
+double PipSize(const string symbol)
+  {
+   double point = SymbolInfoDouble(symbol,SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+   if(digits==3 || digits==5)
+      return(point*10.0);
+   if(digits==1 || digits==2)
+      return(point);
+   if(digits==4)
+      return(point*10.0);
+   return(point);
+  }
+
+double PipsToPrice(const string symbol,const double pips)
+  {
+   return(pips*PipSize(symbol));
+  }
+
+double NormalizePrice(const string symbol,const double price)
+  {
+   int digits = (int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+   return(NormalizeDouble(price,digits));
+  }
+
+void DrawZone(const string symbol,const LevelZone &zone,const color clr,const string prefix)
+  {
+   string name = StringFormat("%s_%s_%.5f",prefix,symbol,zone.price);
+   if(ObjectFind(0,name)>=0)
+      ObjectDelete(0,name);
+   datetime time0 = TimeCurrent();
+   datetime time1 = time0 + PeriodSeconds(InpPrimaryTF)*20;
+   ObjectCreate(0,name,OBJ_RECTANGLE,0,time0,zone.upper,time1,zone.lower);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,name,OBJPROP_BACK,true);
+   ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_DASH);
+   ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
+   ObjectSetString(0,name,OBJPROP_TEXT,StringFormat("Touches:%d",zone.touches));
+  }
+
+void ClearSymbolDrawings(const string symbol)
+  {
+   int total = ObjectsTotal(0,-1,-1);
+   for(int i=total-1;i>=0;i--)
+     {
+      string name = ObjectName(0,i);
+      if(StringFind(name,symbol)>=0)
+         ObjectDelete(0,name);
+     }
+  }
+
+LevelZone *FindMatchingZone(CArrayObj &collection,const double price,const ENUM_LevelType type,const double tolerance)
+  {
+   LevelZone *best=NULL;
+   double best_diff=DBL_MAX;
+   for(int i=0;i<collection.Total();i++)
+     {
+      LevelZone *zone = (LevelZone*)collection.At(i);
+      if(zone==NULL)
+         continue;
+      if(zone->type!=type)
+         continue;
+      double diff = MathAbs(zone->price-price);
+      if(diff<=tolerance && diff<best_diff)
+        {
+         best = zone;
+         best_diff = diff;
+        }
+     }
+   return(best);
+  }
+
+bool AddOrUpdateLevel(CArrayObj &collection,const string symbol,const double price,const ENUM_LevelType type,const datetime touch_time,const double atr,const double zone_width)
+  {
+   double tolerance = zone_width;
+   LevelZone *zone = FindMatchingZone(collection,price,type,tolerance);
+   if(zone!=NULL)
+     {
+      if(zone->last_touch_time>0)
+        {
+         int bars_between = (int)((touch_time-zone->last_touch_time)/PeriodSeconds(InpPrimaryTF));
+         if(bars_between<InpMinBarsBetweenTouches && bars_between>=0)
+            return(false);
+        }
+      zone->touches++;
+      zone->price = (zone->price*(zone->touches-1)+price)/zone->touches;
+      zone->lower = zone->price-zone_width;
+      zone->upper = zone->price+zone_width;
+      zone->last_touch_time = touch_time;
+      return(true);
+     }
+
+   double min_sep = InpMinLevelSeparationPips*PipSize(symbol);
+   for(int i=0;i<collection.Total();i++)
+     {
+      LevelZone *existing = (LevelZone*)collection.At(i);
+      if(existing==NULL)
+         continue;
+      if(existing->type!=type)
+         continue;
+      if(MathAbs(existing->price-price)<min_sep)
+         return(false);
+     }
+
+   LevelZone *new_zone = new LevelZone;
+   new_zone->price = price;
+   new_zone->lower = price-zone_width;
+   new_zone->upper = price+zone_width;
+   new_zone->touches = 1;
+   new_zone->last_touch_time = touch_time;
+   new_zone->type = type;
+   new_zone->atr_on_creation = atr;
+   new_zone->created = touch_time;
+   collection.Add(new_zone);
+   return(true);
+  }
+
+bool DeriveTP3Price(const string symbol,const ENUM_BreakDirection direction,const ENUM_TIMEFRAMES tf,const double entry,const double stop,double &tp_price)
+  {
+   tp_price = 0.0;
+   if(StringFind(StringToLower(InpTP3_Method),"swing")<0)
+      return(false);
+   int depth = InpFractalDepth;
+   for(int i=depth;i<depth+100;i++)
+     {
+      if(direction==BREAK_DIRECTION_BULLISH)
+        {
+         double high = iHigh(symbol,tf,i);
+         bool is_fractal = true;
+         for(int j=1;j<=depth;j++)
+           {
+            if(high<iHigh(symbol,tf,i-j) || high<iHigh(symbol,tf,i+j))
+               is_fractal = false;
+           }
+         if(is_fractal && high>entry)
+           {
+            tp_price = high;
+            return(true);
+           }
+        }
+      else if(direction==BREAK_DIRECTION_BEARISH)
+        {
+         double low = iLow(symbol,tf,i);
+         bool is_fractal = true;
+         for(int j=1;j<=depth;j++)
+           {
+            if(low>iLow(symbol,tf,i-j) || low>iLow(symbol,tf,i+j))
+               is_fractal = false;
+           }
+         if(is_fractal && low<entry)
+           {
+            tp_price = low;
+            return(true);
+           }
+        }
+     }
+   return(false);
+  }
+
+bool PlaceOrders(const string symbol,const ENUM_BreakDirection direction,const LevelZone &zone,const double atr_value,const double confirmation_close)
+  {
+   if(!CheckMaxPositionsPerSymbol(symbol))
+      return(false);
+
+   double current_price = direction==BREAK_DIRECTION_BULLISH ? SymbolInfoDouble(symbol,SYMBOL_ASK) : SymbolInfoDouble(symbol,SYMBOL_BID);
+   double entry_price = current_price;
+   if(InpUseLimitAtMidZone)
+      entry_price = (zone.lower+zone.upper)/2.0;
+
+   entry_price = NormalizePrice(symbol,entry_price);
+
+   double buffer = InpSL_BufferATRmult*atr_value;
+   double atr_sl = InpSL_ATRmult*atr_value;
+   double zone_sl = (direction==BREAK_DIRECTION_BULLISH) ? zone.lower - buffer : zone.upper + buffer;
+
+   double stop_loss = zone_sl;
+   if(InpUseMaxOfZoneOrATR)
+     {
+      if(direction==BREAK_DIRECTION_BULLISH)
+         stop_loss = MathMin(zone_sl,entry_price-atr_sl);
+      else
+         stop_loss = MathMax(zone_sl,entry_price+atr_sl);
+     }
+
+   stop_loss = NormalizePrice(symbol,stop_loss);
+
+   double risk_distance = MathAbs(entry_price-stop_loss);
+   if(risk_distance<=0)
+     {
+      LogPrint(0,"Invalid risk distance");
+      return(false);
+     }
+
+   double point = SymbolInfoDouble(symbol,SYMBOL_POINT);
+   int stops_level = (int)SymbolInfoInteger(symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double min_distance = stops_level>0 ? stops_level*point : 0.0;
+   if(min_distance>0 && risk_distance<min_distance)
+     {
+      LogPrint(0,"Stop loss too close to current price");
+      return(false);
+     }
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double risk_amount = equity*InpRiskPercent/100.0;
+   if(risk_amount<=0)
+      return(false);
+
+   double tick_value = SymbolInfoDouble(symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(symbol,SYMBOL_TRADE_TICK_SIZE);
+   if(tick_value<=0 || tick_size<=0)
+      return(false);
+
+   double risk_per_lot = risk_distance/tick_size*tick_value;
+   if(risk_per_lot<=0.0)
+     {
+      LogPrint(0,"Risk per lot invalid");
+      return(false);
+     }
+
+   double lots = risk_amount/risk_per_lot;
+   double min_lot = SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN);
+   double step_lot = SymbolInfoDouble(symbol,SYMBOL_VOLUME_STEP);
+   double max_lot = SymbolInfoDouble(symbol,SYMBOL_VOLUME_MAX);
+   if(step_lot>0)
+      lots = MathFloor(lots/step_lot)*step_lot;
+   if(lots<min_lot)
+      lots = min_lot;
+   if(max_lot>0 && lots>max_lot)
+      lots = max_lot;
+   int lot_digits = step_lot>0 ? (int)MathRound(-MathLog10(step_lot)) : 2;
+   lots = NormalizeDouble(lots,lot_digits);
+   if(lots<min_lot)
+     {
+      LogPrint(0,"Lot size below minimum");
+      return(false);
+     }
+
+   double actual_risk_amount = risk_per_lot*lots;
+   double upcoming_risk_percent = (equity>0.0) ? actual_risk_amount/equity*100.0 : 0.0;
+   if(!CheckDailyRiskBudget(upcoming_risk_percent))
+      return(false);
+
+   g_trade.SetExpertMagicNumber(InpMagicNumber);
+   g_trade.SetDeviationInPoints(InpSlippagePoints);
+
+   double tp = entry_price + (direction==BREAK_DIRECTION_BULLISH?1:-1)*risk_distance*InpTargetRR;
+   tp = NormalizePrice(symbol,tp);
+
+   string comment = StringFormat("%s-%s",InpCommentPrefix,direction==BREAK_DIRECTION_BULLISH?"BUY":"SELL");
+
+   bool result=false;
+   if(InpUseLimitAtMidZone)
+     {
+      ENUM_ORDER_TYPE type = direction==BREAK_DIRECTION_BULLISH?ORDER_TYPE_BUY_LIMIT:ORDER_TYPE_SELL_LIMIT;
+      result = g_trade.OrderSend(symbol,type,lots,entry_price,InpSlippagePoints,stop_loss,tp,comment);
+     }
+   else
+     {
+      ENUM_ORDER_TYPE type = direction==BREAK_DIRECTION_BULLISH?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
+      result = g_trade.PositionOpen(symbol,type,lots,0.0,stop_loss,tp,comment);
+     }
+
+   if(!result)
+     {
+      LogPrint(0,StringFormat("OrderSend failed: %d",_LastError));
+      return(false);
+     }
+
+   ulong position_ticket = 0;
+   if(!InpUseLimitAtMidZone)
+     {
+      for(int i=0;i<PositionsTotal();i++)
+        {
+         if(!PositionSelectByIndex(i))
+            continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber)
+            continue;
+         if(PositionGetString(POSITION_SYMBOL)!=symbol)
+            continue;
+         position_ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+         break;
+        }
+     }
+
+   if(position_ticket!=0)
+     {
+      TradeState *state = new TradeState;
+      state->ticket = position_ticket;
+      state->symbol = symbol;
+      state->entry_price = entry_price;
+      state->stop_loss = stop_loss;
+      state->risk_per_lot = risk_per_lot;
+      state->planned_risk = actual_risk_amount;
+      state->initial_lots = lots;
+      state->tp_main = tp;
+      state->tp1 = 0;
+      state->tp2 = 0;
+      state->tp3 = 0;
+      state->tp1_done=false;
+      state->tp2_done=false;
+      state->tp3_done=false;
+      if(InpUseMultiTP)
+        {
+         state->tp1 = entry_price + (direction==BREAK_DIRECTION_BULLISH?1:-1)*risk_distance*InpTP1_RR;
+         state->tp2 = entry_price + (direction==BREAK_DIRECTION_BULLISH?1:-1)*risk_distance*InpTP2_RR;
+         double tp3=0;
+         if(DeriveTP3Price(symbol,direction,InpPrimaryTF,entry_price,stop_loss,tp3))
+            state->tp3 = tp3;
+        }
+      g_trade_states.Add(state);
+     }
+
+   LogPrint(0,StringFormat("Placed %s %.2f lots at %.5f SL %.5f TP %.5f",symbol,lots,entry_price,stop_loss,tp));
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert lifecycle                                                 |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   g_symbols.Create();
+   ParseSymbols(InpSymbols);
+   ParseAllowedSessions(InpAllowedHours);
+   g_trade_states.Create();
+   ResetDailyStatsIfNeeded();
+   g_peak_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_trade.SetExpertMagicNumber(InpMagicNumber);
+   EventSetTimer(60);
+   return(INIT_SUCCEEDED);
+  }
+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   for(int i=0;i<g_symbols.Total();i++)
+     {
+      CSymbolState *state = (CSymbolState*)g_symbols.At(i);
+      if(state!=NULL)
+         delete state;
+     }
+   g_symbols.Clear();
+
+   for(int j=0;j<g_trade_states.Total();j++)
+     {
+      TradeState *state = (TradeState*)g_trade_states.At(j);
+      if(state!=NULL)
+         delete state;
+     }
+   g_trade_states.Clear();
+  }
+
+void OnTick()
+  {
+   ResetDailyStatsIfNeeded();
+   EvaluateDrawdownProtection();
+   UpdateTradeStates();
+  }
+
+void OnTimer()
+  {
+   for(int i=0;i<g_symbols.Total();i++)
+     {
+      CSymbolState *state = (CSymbolState*)g_symbols.At(i);
+      if(state==NULL)
+         continue;
+      state->Process();
+     }
+  }
+
