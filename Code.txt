@@ -1,4 +1,113 @@
+#property copyright ""
+#property link      ""
+#property version   "1.00"
+#property strict
 
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+#include <Trade/OrderInfo.mqh>
+#include <Arrays/ArrayObj.mqh>
+
+enum ENUM_TrailMethod
+  {
+   TRAIL_METHOD_NONE=0,
+   TRAIL_METHOD_ATR=1,
+   TRAIL_METHOD_SWING=2
+  };
+
+enum ENUM_LevelType
+  {
+   LEVEL_TYPE_SUPPORT=0,
+   LEVEL_TYPE_RESISTANCE=1
+  };
+
+enum ENUM_BreakDirection
+  {
+   BREAK_DIRECTION_NONE=0,
+   BREAK_DIRECTION_BULLISH=1,
+   BREAK_DIRECTION_BEARISH=-1
+  };
+
+struct TimeRange
+  {
+   int                start_minute;
+   int                end_minute;
+  };
+
+class LevelZone : public CObject
+{
+public:
+   double   price, lower, upper;
+   int      touches;
+   datetime last_touch_time;
+   int      type;             // use your ENUM_LevelType
+   double   atr_on_creation;
+   datetime created;
+
+   // optional ctor
+   LevelZone() : price(0),lower(0),upper(0),touches(0),
+                 last_touch_time(0),type(0),atr_on_creation(0),created(0) {}
+};
+
+class BrokenSetup : public CObject
+{
+public:
+   LevelZone zone;            // value member is fine
+   int       direction;       // use your ENUM_BreakDirection
+   datetime  break_time, expiry_time;
+   bool      retest_tagged, order_placed;
+   double    atr_on_break;
+
+   BrokenSetup() : direction(0),break_time(0),expiry_time(0),
+                   retest_tagged(false),order_placed(false),atr_on_break(0) {}
+};
+
+class TradeState : public CObject
+{
+public:
+   ulong   ticket;
+   string  symbol;
+   double  entry_price, stop_loss;
+   double  risk_per_lot, planned_risk, initial_lots;
+   double  tp_main, tp1, tp2, tp3;
+   bool    tp1_done, tp2_done, tp3_done;
+
+   TradeState() : ticket(0),entry_price(0),stop_loss(0),
+                  risk_per_lot(0),planned_risk(0),initial_lots(0),
+                  tp_main(0),tp1(0),tp2(0),tp3(0),
+                  tp1_done(false),tp2_done(false),tp3_done(false) {}
+};
+
+class CSymbolState
+  {
+private:
+   bool      m_primary_state;
+   datetime  m_last_bar_time;
+
+   bool      IsNewPrimaryBar(datetime &bar_time);
+
+public:
+             CSymbolState()
+             : m_primary_state(false),
+               m_last_bar_time(0)
+             {
+             }
+
+   void      Reset()
+             {
+              m_primary_state = false;
+              m_last_bar_time = 0;
+             }
+  };
+
+bool CSymbolState::IsNewPrimaryBar(datetime &bar_time)
+  {
+   if(bar_time <= m_last_bar_time)
+      return(false);
+
+   m_last_bar_time = bar_time;
+   return(true);
+  }
   
   bool CSymbolState::IsNewPrimaryBar(datetime &bar_time)
 {
@@ -1480,4 +1589,5 @@ void OnTimer()
          continue;
       state.Process();
      }
+
   }
