@@ -7,7 +7,30 @@
 #include <Trade/PositionInfo.mqh>
 #include <Trade/OrderInfo.mqh>
 #include <Arrays/ArrayObj.mqh>
+
+#ifdef __MQL5__
+#ifdef BRSWING_USE_CALENDAR
 #include <Calendar/Calendar.mqh>
+#endif
+//--- optional calendar support (fallback stub if standard include is unavailable)
+#ifndef CALENDAR_IMPORTANCE_LOW
+ #define CALENDAR_IMPORTANCE_LOW   0
+ #define CALENDAR_IMPORTANCE_MEDIUM 1
+ #define CALENDAR_IMPORTANCE_HIGH  2
+ #define BRSWING_CALENDAR_STUB     1
+struct CalendarValue
+  {
+   datetime           time;
+   int                importance;
+  };
+int CalendarValueHistory(CalendarValue &values[],datetime from,datetime to)
+  {
+   ArrayResize(values,0);
+   return(0);
+  }
+#endif
+#endif
+
 
 enum ENUM_TrailMethod
   {
@@ -35,8 +58,35 @@ struct TimeRange
    int                end_minute;
   };
 
-struct LevelZone
+
+class LevelZone : public CObject
   {
+public:
+                     LevelZone()
+     : price(0.0),
+       lower(0.0),
+       upper(0.0),
+       touches(0),
+       last_touch_time(0),
+       type(LEVEL_TYPE_SUPPORT),
+       atr_on_creation(0.0),
+       created(0)
+     {
+     }
+
+   void               CopyFrom(const LevelZone &other)
+     {
+      price = other.price;
+      lower = other.lower;
+      upper = other.upper;
+      touches = other.touches;
+      last_touch_time = other.last_touch_time;
+      type = other.type;
+      atr_on_creation = other.atr_on_creation;
+      created = other.created;
+     }
+
+
    double             price;
    double             lower;
    double             upper;
@@ -47,8 +97,20 @@ struct LevelZone
    datetime           created;
   };
 
-struct BrokenSetup
+
+class BrokenSetup : public CObject
   {
+public:
+                     BrokenSetup()
+     : direction(BREAK_DIRECTION_NONE),
+       break_time(0),
+       expiry_time(0),
+       retest_tagged(false),
+       order_placed(false),
+       atr_on_break(0.0)
+     {
+     }
+
    LevelZone          zone;
    ENUM_BreakDirection direction;
    datetime           break_time;
@@ -58,8 +120,27 @@ struct BrokenSetup
    double             atr_on_break;
   };
 
-struct TradeState
+class TradeState : public CObject
   {
+public:
+                     TradeState()
+     : ticket(0),
+       symbol(""),
+       entry_price(0.0),
+       stop_loss(0.0),
+       risk_per_lot(0.0),
+       planned_risk(0.0),
+       initial_lots(0.0),
+       tp_main(0.0),
+       tp1(0.0),
+       tp2(0.0),
+       tp3(0.0),
+       tp1_done(false),
+       tp2_done(false),
+       tp3_done(false)
+     {
+     }
+
    ulong              ticket;
    string             symbol;
    double             entry_price;
@@ -93,6 +174,7 @@ public:
 
    friend bool        IsNewPrimaryBar(CSymbolState *state,datetime &bar_time);
 
+
 private:
    string             m_symbol;
    ENUM_TIMEFRAMES    m_primary_tf;
@@ -108,6 +190,8 @@ private:
    void               CleanupExpiredSetups(const datetime current_time);
    void               DrawZones();
    void               ClearDrawings();
+   bool               UpdatePrimaryBar(datetime &bar_time);
+
   };
 
 //--- trading and order helpers
@@ -206,7 +290,9 @@ void   ParseAllowedSessions(const string text);
 bool   IsWithinAllowedSession(const datetime current_time);
 bool   IsSpreadAcceptable(const string symbol);
 double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period);
+
 bool   IsNewPrimaryBar(CSymbolState *state,datetime &bar_time);
+
 bool   CheckNewsWindow();
 void   ResetDailyStatsIfNeeded();
 void   UpdateRiskLimits();
@@ -273,7 +359,9 @@ void CSymbolState::Reset()
 void CSymbolState::Process()
   {
    datetime bar_time = 0;
-   if(!IsNewPrimaryBar(this,bar_time))
+
+   if(!UpdatePrimaryBar(bar_time))
+
       return;
 
    MqlRates rates[];
@@ -315,6 +403,19 @@ void CSymbolState::Process()
 void CSymbolState::ManagePositions()
   {
    // placeholder: actual management handled globally to allow multi-symbol sync
+  }
+
+
+bool CSymbolState::UpdatePrimaryBar(datetime &bar_time)
+  {
+   datetime times[1];
+   if(CopyTime(m_symbol,m_primary_tf,0,1,times)!=1)
+      return(false);
+   if(m_last_primary_bar==times[0])
+      return(false);
+   m_last_primary_bar = times[0];
+   bar_time = times[0];
+   return(true);
   }
 
 void CSymbolState::UpdatePrimarySeries()
@@ -673,24 +774,23 @@ double CurrentATR(const string symbol,const ENUM_TIMEFRAMES tf,const int period)
    return(buffer[0]);
   }
 
-bool IsNewPrimaryBar(CSymbolState *state,datetime &bar_time)
-  {
-   if(state==NULL)
-      return(false);
-   string symbol = state.Symbol();
-   datetime times[1];
-   if(CopyTime(symbol,InpPrimaryTF,0,1,times)!=1)
-      return(false);
-   if(state.m_last_primary_bar==times[0])
-      return(false);
-   state.m_last_primary_bar = times[0];
-   bar_time = times[0];
-   return(true);
-  }
 
 bool CheckNewsWindow()
   {
 #ifdef __MQL5__
+ #ifdef BRSWING_CALENDAR_STUB
+   if(InpUseNewsFilter)
+     {
+      static bool warned=false;
+      if(!warned)
+        {
+         LogPrint(0,"News filter enabled but calendar library is unavailable; skipping filter checks.");
+         warned=true;
+        }
+     }
+   return(true);
+ #else
+
    if(!InpUseNewsFilter)
       return(true);
    datetime from = TimeCurrent() - InpNewsBlockMinutesBefore*60;
@@ -713,6 +813,9 @@ bool CheckNewsWindow()
         }
      }
    return(true);
+
+ #endif
+
 #else
    return(true);
 #endif
@@ -758,6 +861,12 @@ void ResetDailyStatsIfNeeded()
         }
      }
   }
+
+void UpdateRiskLimits()
+  {
+   // risk governance is evaluated dynamically via EvaluateDrawdownProtection and budgeting helpers
+  }
+
 
 void UpdatePeakEquity()
   {
